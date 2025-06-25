@@ -22,7 +22,7 @@ from PIL import Image, ImageFilter
 app = FastAPI(
     title="Image Labeling Tool API",
     description="API for a simple image labeling tool with file-based persistence and image processing.",
-    version="1.4.0"
+    version="1.4.1"
 )
 
 # --- CORS Configuration ---
@@ -108,8 +108,9 @@ class DashboardStats(BaseModel):
     recent_tasks: List[TaskOut]
 
 class ProcessRequest(BaseModel):
-    action: str  # 'blacken', 'blur', 'crop'
+    action: str
     label_ids: List[int]
+    blur_radius: Optional[int] = 15
 
 # --- CSV-based Database Simulation ---
 db: Dict[str, pd.DataFrame] = {}
@@ -223,60 +224,45 @@ async def get_dashboard_summary():
 
 @app.post("/api/tasks/{task_id}/process", tags=["Export"])
 async def process_task_images(task_id: int, request: ProcessRequest):
-    """Processes images in a task (crop, blacken, blur) and returns a ZIP file."""
-    if not request.label_ids: raise HTTPException(status_code=400, detail="No labels selected for processing.")
-    
+    if not request.label_ids: raise HTTPException(status_code=400, detail="No labels selected.")
     images_df = db["images"][db["images"]["task_id"] == task_id]
-    if images_df.empty: raise HTTPException(status_code=404, detail="No images found for this task.")
-    
+    if images_df.empty: raise HTTPException(status_code=404, detail="No images in task.")
     image_ids = set(images_df["id"])
     annotations_df = db["annotations"][(db["annotations"]["image_id"].isin(image_ids)) & (db["annotations"]["label_id"].isin(request.label_ids))]
-    if annotations_df.empty: raise HTTPException(status_code=404, detail="No annotations found for the selected labels.")
+    if annotations_df.empty: raise HTTPException(status_code=404, detail="No annotations for selected labels.")
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         if request.action == "crop":
             for _, ann in annotations_df.iterrows():
-                image_record = images_df[images_df["id"] == ann["image_id"]].iloc[0]
-                img_path = image_record["storage_path"]
-                if not os.path.exists(img_path): continue
-                
-                with Image.open(img_path) as img:
+                img_rec = images_df[images_df["id"] == ann["image_id"]].iloc[0]
+                if not os.path.exists(img_rec["storage_path"]): continue
+                with Image.open(img_rec["storage_path"]) as img:
                     bbox = ann["bounding_box"]
                     box_tuple = (bbox['x'], bbox['y'], bbox['x'] + bbox['width'], bbox['y'] + bbox['height'])
-                    cropped_img = img.crop(box_tuple)
-                    
-                    img_byte_arr = io.BytesIO()
-                    cropped_img.save(img_byte_arr, format='PNG')
-                    img_byte_arr.seek(0)
-                    
-                    base, _ = os.path.splitext(image_record["original_filename"])
+                    cropped = img.crop(box_tuple)
+                    img_byte_arr = io.BytesIO(); cropped.save(img_byte_arr, format='PNG'); img_byte_arr.seek(0)
+                    base, _ = os.path.splitext(img_rec["original_filename"])
                     zip_file.writestr(f"{base}_crop_{ann['id']}.png", img_byte_arr.getvalue())
-        else: # blacken or blur
-            images_to_process = images_df[images_df['id'].isin(set(annotations_df['image_id']))]
-            for _, image_record in images_to_process.iterrows():
-                img_path = image_record["storage_path"]
-                if not os.path.exists(img_path): continue
-                
-                with Image.open(img_path) as img:
+        else:
+            imgs_to_process = images_df[images_df['id'].isin(set(annotations_df['image_id']))]
+            for _, img_rec in imgs_to_process.iterrows():
+                if not os.path.exists(img_rec["storage_path"]): continue
+                with Image.open(img_rec["storage_path"]) as img:
                     img = img.convert("RGBA")
-                    anns_for_img = annotations_df[annotations_df["image_id"] == image_record["id"]]
+                    anns_for_img = annotations_df[annotations_df["image_id"] == img_rec["id"]]
                     for _, ann in anns_for_img.iterrows():
                         bbox = ann["bounding_box"]
-                        box_tuple = (int(bbox['x']), int(bbox['y']), int(bbox['x'] + bbox['width']), int(bbox['y'] + bbox['height']))
-                        
+                        box = (int(bbox['x']), int(bbox['y']), int(bbox['x'] + bbox['width']), int(bbox['y'] + bbox['height']))
                         if request.action == "blacken":
-                            region = Image.new('RGBA', (box_tuple[2]-box_tuple[0], box_tuple[3]-box_tuple[1]), (0, 0, 0, 255))
-                            img.paste(region, box_tuple)
+                            region = Image.new('RGBA', (box[2]-box[0], box[3]-box[1]), (0, 0, 0, 255))
                         elif request.action == "blur":
-                            region = img.crop(box_tuple)
-                            region = region.filter(ImageFilter.GaussianBlur(radius=15))
-                            img.paste(region, box_tuple)
-
-                    img_byte_arr = io.BytesIO()
-                    img.save(img_byte_arr, format='PNG')
-                    img_byte_arr.seek(0)
-                    zip_file.writestr(image_record["original_filename"], img_byte_arr.getvalue())
+                            region = img.crop(box)
+                            radius = max(1, min(request.blur_radius, 50))
+                            region = region.filter(ImageFilter.GaussianBlur(radius=radius))
+                        img.paste(region, box)
+                    img_byte_arr = io.BytesIO(); img.save(img_byte_arr, format='PNG'); img_byte_arr.seek(0)
+                    zip_file.writestr(img_rec["original_filename"], img_byte_arr.getvalue())
 
     zip_buffer.seek(0)
     filename = f"task_{task_id}_{request.action}.zip"
