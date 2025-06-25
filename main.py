@@ -9,24 +9,23 @@ import os
 import shutil
 import zipfile
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from PIL import Image
 
 # --- App Initialization ---
 app = FastAPI(
     title="Image Labeling Tool API",
-    description="API for a simple image labeling tool using FastAPI.",
-    version="1.0.0"
+    description="API for a simple image labeling tool with file-based persistence.",
+    version="1.2.0"
 )
 
 # --- CORS Configuration ---
-# Allows the React frontend (running on http://localhost:3000) to communicate with this backend.
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -41,21 +40,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# --- Directory Setup ---
-# Create directories to store uploaded zips and extracted task images.
-# In a production environment, you would use a more robust solution like S3.
-UPLOADS_DIR = "data/uploads"
-TASKS_DIR = "data/tasks"
+# --- Directory and Data File Setup ---
+DATA_DIR = "data"
+UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
+TASKS_DIR = os.path.join(DATA_DIR, "tasks")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(TASKS_DIR, exist_ok=True)
 
+# Define paths for our CSV "database" files
+DB_PATHS = {
+    "tasks": os.path.join(DATA_DIR, "tasks.csv"),
+    "images": os.path.join(DATA_DIR, "images.csv"),
+    "labels": os.path.join(DATA_DIR, "labels.csv"),
+    "annotations": os.path.join(DATA_DIR, "annotations.csv"),
+}
 
-# --- Pydantic Models (Data Schemas) ---
-# These models define the shape of the data for requests and responses.
-
+# --- Pydantic Models ---
 class BoundingBox(BaseModel):
-    # *** CHANGE: Updated from int to float to allow for precise coordinates ***
     x: float
     y: float
     width: float
@@ -76,14 +77,14 @@ class ImageOut(BaseModel):
     task_id: int
     original_filename: str
     storage_path: str
-    status: str  # 'unlabeled' or 'labeled'
+    status: str
     width: int
     height: int
 
 class TaskOut(BaseModel):
     id: int
     name: str
-    status: str  # 'processing', 'ready', 'in_progress', 'completed'
+    status: str
     created_at: datetime
 
 class LabelOut(BaseModel):
@@ -93,254 +94,246 @@ class LabelOut(BaseModel):
 class LabelIn(BaseModel):
     name: str
 
-# --- In-Memory Database Simulation ---
-# Using dictionaries to simulate database tables for rapid prototyping.
-# In a real application, this would be replaced with a PostgreSQL database and SQLAlchemy ORM.
-db: Dict[str, list] = {
-    "tasks": [],
-    "images": [],
-    "labels": [],
-    "annotations": [],
-}
+# --- CSV-based Database Simulation ---
+db: Dict[str, pd.DataFrame] = {}
 
-# Pre-populate with some data for demonstration
-db["labels"] = [
-    {"id": 1, "name": "Cat"},
-    {"id": 2, "name": "Dog"},
-]
-NEXT_LABEL_ID = 3
+def load_or_initialize_db():
+    """
+    Loads data from CSV files into pandas DataFrames.
+    If a file doesn't exist, it creates an empty DataFrame with the correct columns.
+    """
+    global db
+    
+    schemas = {
+        "tasks": {"id": pd.Int64Dtype(), "name": object, "status": object, "created_at": object},
+        "images": {"id": pd.Int64Dtype(), "task_id": pd.Int64Dtype(), "original_filename": object, "storage_path": object, "status": object, "width": pd.Int64Dtype(), "height": pd.Int64Dtype()},
+        "labels": {"id": pd.Int64Dtype(), "name": object},
+        "annotations": {"id": pd.Int64Dtype(), "image_id": pd.Int64Dtype(), "label_id": pd.Int64Dtype(), "bounding_box": object},
+    }
+    
+    for table, path in DB_PATHS.items():
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            db[table] = pd.read_csv(path)
+        else:
+            db[table] = pd.DataFrame(columns=list(schemas[table].keys())).astype(schemas[table])
+            if table == "labels" and db[table].empty:
+                default_labels = [{"id": 1, "name": "Cat"}, {"id": 2, "name": "Dog"}]
+                db["labels"] = pd.DataFrame(default_labels)
+                save_table("labels")
+    
+    if 'bounding_box' in db['annotations'].columns:
+        db['annotations']['bounding_box'] = db['annotations']['bounding_box'].apply(
+            lambda x: eval(x) if isinstance(x, str) else x
+        )
 
+@app.on_event("startup")
+async def startup_event():
+    print("Loading database from CSV files...")
+    load_or_initialize_db()
+    print("Database loaded.")
+
+def save_table(table_name: str):
+    if table_name in db:
+        db[table_name].to_csv(DB_PATHS[table_name], index=False)
 
 # --- Background Task for ZIP Processing ---
-
 async def process_zip_file(task_id: int, zip_path: str):
-    """
-    Simulates a background worker processing the uploaded ZIP file.
-    - Unzips the file.
-    - Filters for valid image types.
-    - Creates image records in the 'database'.
-    - Updates the task status.
-    """
-    await asyncio.sleep(2) # Simulate processing time
-
+    await asyncio.sleep(2)
     task_dir = os.path.join(TASKS_DIR, str(task_id))
     os.makedirs(task_dir, exist_ok=True)
-    
     image_extensions = {".jpg", ".jpeg", ".png", ".tiff", ".bmp"}
-    image_id_counter = len(db["images"]) + 1
 
     try:
+        current_max_id = db["images"]['id'].max() if not db["images"].empty else 0
+        image_id_counter = int(current_max_id) + 1
+        new_images = []
+
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             for filename in zip_ref.namelist():
-                # *** FIX: Ignore __MACOSX directory and other hidden files (like .DS_Store) ***
-                if filename.startswith('__MACOSX/') or os.path.basename(filename).startswith('.'):
-                    continue
-
+                if filename.startswith('__MACOSX/') or os.path.basename(filename).startswith('.'): continue
                 if os.path.splitext(filename)[1].lower() in image_extensions:
-                    # Extract file and save it
-                    source = zip_ref.open(filename)
-                    # Ensure we only use the filename and not any directory structure from the zip
                     sanitized_filename = os.path.basename(filename)
-                    if not sanitized_filename: continue # Skip if it's just a directory entry
-
+                    if not sanitized_filename: continue
                     target_path = os.path.join(task_dir, sanitized_filename)
-                    with open(target_path, "wb") as f:
-                        f.write(source.read())
+                    with zip_ref.open(filename) as source, open(target_path, "wb") as f: f.write(source.read())
 
-                    # Get image dimensions
                     try:
-                        with Image.open(target_path) as img:
-                            width, height = img.size
-                    except Exception:
-                        width, height = 0, 0 # Could not read image
-
-                    # Create image record
-                    new_image = {
-                        "id": image_id_counter,
-                        "task_id": task_id,
-                        "original_filename": sanitized_filename,
-                        "storage_path": target_path,
-                        "status": "unlabeled",
-                        "width": width,
-                        "height": height
-                    }
-                    db["images"].append(new_image)
+                        with Image.open(target_path) as img: width, height = img.size
+                    except Exception: width, height = 0, 0
+                    
+                    new_images.append({
+                        "id": image_id_counter, "task_id": task_id, "original_filename": sanitized_filename,
+                        "storage_path": target_path, "status": "unlabeled", "width": width, "height": height
+                    })
                     image_id_counter += 1
-
-        # Update task status upon successful processing
-        for task in db["tasks"]:
-            if task["id"] == task_id:
-                task["status"] = "ready"
-                break
+        
+        if new_images:
+            db["images"] = pd.concat([db["images"], pd.DataFrame(new_images)], ignore_index=True)
+        
+        task_idx = db["tasks"][db["tasks"]["id"] == task_id].index
+        if not task_idx.empty: db["tasks"].loc[task_idx, "status"] = "ready"
     except Exception as e:
         print(f"Error processing task {task_id}: {e}")
-        # Update task status to reflect failure
-        for task in db["tasks"]:
-            if task["id"] == task_id:
-                task["status"] = "failed"
-                break
+        task_idx = db["tasks"][db["tasks"]["id"] == task_id].index
+        if not task_idx.empty: db["tasks"].loc[task_idx, "status"] = "failed"
     finally:
-        # Clean up the original zip file
-        os.remove(zip_path)
+        save_table("images")
+        save_table("tasks")
+        if os.path.exists(zip_path): os.remove(zip_path)
 
+def get_next_id(table_name: str) -> int:
+    table = db.get(table_name)
+    if table is None or table.empty: return 1
+    return int(table["id"].max()) + 1
 
 # --- API Endpoints ---
-
 @app.get("/api/tasks", response_model=List[TaskOut], tags=["Tasks"])
 async def get_tasks():
-    """Retrieve all tasks."""
-    # Return tasks in reverse chronological order
-    return sorted(db["tasks"], key=lambda x: x["created_at"], reverse=True)
-
+    if db["tasks"].empty: return []
+    tasks_df = db["tasks"].copy()
+    tasks_df['created_at'] = pd.to_datetime(tasks_df['created_at'])
+    return tasks_df.sort_values(by="created_at", ascending=False).to_dict('records')
 
 @app.post("/api/tasks/upload", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED, tags=["Tasks"])
 async def create_upload_task(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Accepts a ZIP file, creates a task, and starts background processing."""
     if not file.filename.endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a ZIP file.")
+        raise HTTPException(status_code=400, detail="Invalid file type.")
 
-    # Save the uploaded file temporarily
     file_path = os.path.join(UPLOADS_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    with open(file_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
 
-    # Create a new task in the 'database'
-    task_id = len(db["tasks"]) + 1
-    new_task = {
-        "id": task_id,
-        "name": file.filename,
-        "status": "processing",
-        "created_at": datetime.now()
-    }
-    db["tasks"].append(new_task)
-
-    # Add the ZIP processing to a background task
+    task_id = get_next_id("tasks")
+    new_task = {"id": task_id, "name": file.filename, "status": "processing", "created_at": datetime.now()}
+    db["tasks"] = pd.concat([db["tasks"], pd.DataFrame([new_task])], ignore_index=True)
+    save_table("tasks")
+    
     background_tasks.add_task(process_zip_file, task_id, file_path)
-
     return new_task
 
 @app.get("/api/tasks/{task_id}/images", response_model=List[ImageOut], tags=["Images"])
 async def get_task_images(task_id: int):
-    """Get all images associated with a specific task."""
-    images = [img for img in db["images"] if img["task_id"] == task_id]
-    return images
+    images = db["images"][db["images"]["task_id"] == task_id]
+    return images.to_dict('records')
 
 @app.get("/api/images/{image_id}", tags=["Images"])
 async def get_image_file(image_id: int):
-    """Serves a single image file."""
-    image_record = next((img for img in db["images"] if img["id"] == image_id), None)
-    if not image_record or not os.path.exists(image_record["storage_path"]):
-        raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(image_record["storage_path"])
+    image_record = db["images"][db["images"]["id"] == image_id]
+    if image_record.empty: raise HTTPException(status_code=404, detail="Image not found")
+    path = image_record.iloc[0]["storage_path"]
+    if not os.path.exists(path): raise HTTPException(status_code=404, detail="Image file not found on disk")
+    return FileResponse(path)
 
 @app.get("/api/labels", response_model=List[LabelOut], tags=["Labels"])
 async def get_labels():
-    """Retrieve all available labels."""
-    return db["labels"]
+    return db["labels"].sort_values(by="name").to_dict('records')
 
 @app.post("/api/labels", response_model=LabelOut, status_code=status.HTTP_201_CREATED, tags=["Labels"])
 async def create_label(label: LabelIn):
-    """Creates a new label."""
-    global NEXT_LABEL_ID
-    # Check for duplicates
-    if any(l["name"].lower() == label.name.lower() for l in db["labels"]):
+    if db["labels"]["name"].str.lower().eq(label.name.lower()).any():
         raise HTTPException(status_code=409, detail="Label with this name already exists")
     
-    new_label = {"id": NEXT_LABEL_ID, "name": label.name}
-    db["labels"].append(new_label)
-    NEXT_LABEL_ID += 1
+    new_label = {"id": get_next_id("labels"), "name": label.name}
+    db["labels"] = pd.concat([db["labels"], pd.DataFrame([new_label])], ignore_index=True)
+    save_table("labels")
     return new_label
+
+@app.delete("/api/labels/{label_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Labels"])
+async def delete_label(label_id: int):
+    if not (db["labels"]["id"] == label_id).any():
+        raise HTTPException(status_code=404, detail="Label not found")
+    if not db["annotations"].empty and (db["annotations"]["label_id"] == label_id).any():
+        raise HTTPException(status_code=409, detail="Cannot delete label. It is used in annotations.")
+    db["labels"] = db["labels"][db["labels"]["id"] != label_id]
+    save_table("labels")
+    return
 
 @app.post("/api/images/{image_id}/annotations", response_model=AnnotationOut, status_code=status.HTTP_201_CREATED, tags=["Annotations"])
 async def create_annotation(image_id: int, annotation: AnnotationIn):
-    """Creates a new annotation for a specific image."""
-    # Ensure image exists
-    if not any(img["id"] == image_id for img in db["images"]):
+    if not (db["images"]["id"] == image_id).any():
         raise HTTPException(status_code=404, detail="Image not found")
 
-    # Create annotation record
-    ann_id = len(db["annotations"]) + 1
-    new_annotation = {
-        "id": ann_id,
-        "image_id": image_id,
-        "label_id": annotation.label_id,
-        "bounding_box": annotation.bounding_box.dict()
-    }
-    db["annotations"].append(new_annotation)
-
-    # Update image and task status
-    for img in db["images"]:
-        if img["id"] == image_id:
-            img["status"] = "labeled"
-            # Check if all images in the task are now labeled
-            task_images = [i for i in db["images"] if i["task_id"] == img["task_id"]]
-            if all(i["status"] == "labeled" for i in task_images):
-                for task in db["tasks"]:
-                    if task["id"] == img["task_id"]:
-                        task["status"] = "completed"
-            else:
-                 for task in db["tasks"]:
-                    if task["id"] == img["task_id"] and task["status"] != "completed":
-                        task["status"] = "in_progress"
-
-            break
-
+    ann_id = get_next_id("annotations")
+    new_annotation = {"id": ann_id, "image_id": image_id, "label_id": annotation.label_id, "bounding_box": annotation.bounding_box.dict()}
+    db["annotations"] = pd.concat([db["annotations"], pd.DataFrame([new_annotation])], ignore_index=True)
+    update_statuses(image_id=image_id)
+    save_table("annotations"); save_table("images"); save_table("tasks")
     return new_annotation
 
+@app.delete("/api/annotations/{annotation_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Annotations"])
+async def delete_annotation(annotation_id: int):
+    ann_df = db["annotations"]
+    if ann_df[ann_df["id"] == annotation_id].empty:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    image_id = ann_df[ann_df["id"] == annotation_id].iloc[0]["image_id"]
+    db["annotations"] = ann_df[ann_df["id"] != annotation_id]
+    update_statuses(image_id=int(image_id))
+    save_table("annotations"); save_table("images"); save_table("tasks")
+    return
+
+def update_statuses(image_id: int):
+    img_record = db["images"][db["images"]["id"] == image_id]
+    if img_record.empty: return
+    task_id = img_record.iloc[0]["task_id"]
+    image_annotations = db["annotations"][db["annotations"]["image_id"] == image_id]
+    new_image_status = "labeled" if not image_annotations.empty else "unlabeled"
+    db["images"].loc[db["images"]["id"] == image_id, "status"] = new_image_status
+    task_images = db["images"][db["images"]["task_id"] == task_id]
+    if not task_images.empty:
+        if (task_images["status"] == "labeled").all(): new_task_status = "completed"
+        elif (task_images["status"] == "labeled").any(): new_task_status = "in_progress"
+        else: new_task_status = "ready"
+        db["tasks"].loc[db["tasks"]["id"] == task_id, "status"] = new_task_status
 
 @app.get("/api/tasks/{task_id}/annotations", response_model=List[AnnotationOut], tags=["Annotations"])
 async def get_task_annotations(task_id: int):
-    """Gets all annotations for a given task."""
-    task_image_ids = {img["id"] for img in db["images"] if img["task_id"] == task_id}
-    return [ann for ann in db["annotations"] if ann["image_id"] in task_image_ids]
-
+    task_image_ids = set(db["images"][db["images"]["task_id"] == task_id]["id"])
+    if not task_image_ids: return []
+    task_annotations = db["annotations"][db["annotations"]["image_id"].isin(task_image_ids)]
+    return task_annotations.to_dict('records')
 
 @app.get("/api/tasks/{task_id}/export", tags=["Export"])
 async def export_task_annotations_to_excel(task_id: int):
-    """Exports all annotations for a task to an Excel file."""
-    task = next((t for t in db["tasks"] if t["id"] == task_id), None)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # Gather data
-    data = []
-    task_image_ids = {img["id"]: img for img in db["images"] if img["task_id"] == task_id}
-    labels_map = {lbl["id"]: lbl["name"] for lbl in db["labels"]}
-
-    for ann in db["annotations"]:
-        if ann["image_id"] in task_image_ids:
-            image = task_image_ids[ann["image_id"]]
-            data.append({
-                "task_id": task_id,
-                "task_name": task["name"],
-                "image_id": image["id"],
-                "image_filename": image["original_filename"],
-                "image_width": image["width"],
-                "image_height": image["height"],
-                "annotation_id": ann["id"],
-                "label_name": labels_map.get(ann["label_id"], "Unknown"),
-                "bbox_x": ann["bounding_box"]["x"],
-                "bbox_y": ann["bounding_box"]["y"],
-                "bbox_width": ann["bounding_box"]["width"],
-                "bbox_height": ann["bounding_box"]["height"],
-            })
+    """Exports all annotations for a task to an Excel file. (FIXED)"""
+    task_df = db["tasks"]
+    task_record = task_df[task_df["id"] == task_id]
+    if task_record.empty: raise HTTPException(status_code=404, detail="Task not found")
     
-    # *** FIX: Check if data list is empty. If so, raise an error. ***
-    if not data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail="No annotations found to export for this task."
-        )
+    images_df = db["images"][db["images"]["task_id"] == task_id]
+    if images_df.empty: raise HTTPException(status_code=404, detail="No images found for this task.")
+    
+    image_ids = set(images_df["id"])
+    annotations_df = db["annotations"][db["annotations"]["image_id"].isin(image_ids)]
+    if annotations_df.empty: raise HTTPException(status_code=404, detail="No annotations to export for this task.")
+    
+    labels_df = db["labels"]
+    
+    # Build the data list manually to avoid complex merge issues
+    export_data = []
+    for _, ann in annotations_df.iterrows():
+        image_info = images_df[images_df["id"] == ann["image_id"]].iloc[0]
+        label_info = labels_df[labels_df["id"] == ann["label_id"]].iloc[0]
+        bbox = ann["bounding_box"]
+        
+        export_data.append({
+            "task_id": task_id,
+            "task_name": task_record.iloc[0]["name"],
+            "image_id": ann["image_id"],
+            "image_filename": image_info["original_filename"],
+            "image_width": image_info["width"],
+            "image_height": image_info["height"],
+            "annotation_id": ann["id"],
+            "label_name": label_info["name"],
+            "bbox_x": bbox["x"],
+            "bbox_y": bbox["y"],
+            "bbox_width": bbox["width"],
+            "bbox_height": bbox["height"],
+        })
 
-    # Create Excel file in memory
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(export_data)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Annotations')
     output.seek(0)
     
-    headers = {
-        'Content-Disposition': f'attachment; filename="task_{task_id}_annotations.xlsx"'
-    }
-
+    headers = {'Content-Disposition': f'attachment; filename="task_{task_id}_annotations.xlsx"'}
     return StreamingResponse(output, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
