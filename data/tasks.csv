@@ -1,5 +1,3 @@
 id,name,status,created_at
-1,Archive.zip,in_progress,2025-06-25 20:14:20.597754
-2,personal.zip,ready,2025-06-26 09:49:12.414791
-3,trial_ICR_5.zip,ready,2025-07-03 12:20:48.522982
-4,out_trial.zip,ready,2025-07-03 12:32:34.555706
+1,out_trial.zip,ready,2025-07-03 13:21:42.461533
+2,trial_ICR_5.zip,completed,2025-07-03 13:22:37.291077

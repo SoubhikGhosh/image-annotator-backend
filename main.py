@@ -1,20 +1,15 @@
-# main.py
-# To run this app:
-# 1. pip install -r requirements.txt
-# 2. uvicorn main:app --reload
-
 import asyncio
 import io
 import os
-import shutil
 import zipfile
+import base64
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from PIL import Image, ImageFilter
 
@@ -42,9 +37,7 @@ app.add_middleware(
 
 # --- Directory and Data File Setup ---
 DATA_DIR = "data"
-UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
 TASKS_DIR = os.path.join(DATA_DIR, "tasks")
-os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(TASKS_DIR, exist_ok=True)
 
 DB_PATHS = {
@@ -75,10 +68,10 @@ class ImageOut(BaseModel):
     id: int
     task_id: int
     original_filename: str
-    storage_path: str
     status: str
     width: int
     height: int
+    data: str # Base64 encoded image data
 
 class TaskOut(BaseModel):
     id: int
@@ -119,7 +112,7 @@ def load_or_initialize_db():
     global db
     schemas = {
         "tasks": {"id": pd.Int64Dtype(), "name": object, "status": object, "created_at": object},
-        "images": {"id": pd.Int64Dtype(), "task_id": pd.Int64Dtype(), "original_filename": object, "storage_path": object, "status": object, "width": pd.Int64Dtype(), "height": pd.Int64Dtype()},
+        "images": {"id": pd.Int64Dtype(), "task_id": pd.Int64Dtype(), "original_filename": object, "data": object, "status": object, "width": pd.Int64Dtype(), "height": pd.Int64Dtype()},
         "labels": {"id": pd.Int64Dtype(), "name": object},
         "annotations": {"id": pd.Int64Dtype(), "image_id": pd.Int64Dtype(), "label_id": pd.Int64Dtype(), "bounding_box": object},
     }
@@ -133,9 +126,14 @@ def load_or_initialize_db():
                 db["labels"] = pd.DataFrame([{"id": 1, "name": "Cat"}, {"id": 2, "name": "Dog"}])
                 save_table("labels")
     
+    # Ensure 'bounding_box' is correctly parsed after loading from CSV
     if 'bounding_box' in db['annotations'].columns:
+        # Check if bounding_box column exists and convert string representations to actual dicts
+        # Only apply eval if the type is string, otherwise leave as is (e.g., if it's already dict)
         db['annotations']['bounding_box'] = db['annotations']['bounding_box'].apply(
-            lambda x: eval(x) if isinstance(x, str) else x)
+            lambda x: eval(x) if isinstance(x, str) else x
+        )
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -148,40 +146,77 @@ def save_table(table_name: str):
         db[table_name].to_csv(DB_PATHS[table_name], index=False)
 
 # --- Background & Helper Functions ---
-async def process_zip_file(task_id: int, zip_path: str):
-    await asyncio.sleep(2)
+async def process_zip_file(task_id: int, zip_content: bytes):
+    await asyncio.sleep(2) # Simulate processing time
     task_dir = os.path.join(TASKS_DIR, str(task_id))
     os.makedirs(task_dir, exist_ok=True)
+
     image_extensions = {".jpg", ".jpeg", ".png", ".tiff", ".bmp"}
+    # Define preferred output format and mime type for browser display
+    output_format = "PNG"
+    output_mime_type = "image/png"
+
     try:
         current_max_id = db["images"]['id'].max() if not db["images"].empty else 0
         image_id_counter = int(current_max_id) + 1
         new_images = []
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+
+        with zipfile.ZipFile(io.BytesIO(zip_content), 'r') as zip_ref:
             for filename in zip_ref.namelist():
                 if filename.startswith('__MACOSX/') or filename.split('/')[-1].startswith('.'): continue
                 if os.path.splitext(filename)[1].lower() in image_extensions:
                     sanitized_filename = os.path.basename(filename)
                     if not sanitized_filename: continue
-                    target_path = os.path.join(task_dir, sanitized_filename)
-                    with zip_ref.open(filename) as source, open(target_path, "wb") as f: f.write(source.read())
+                    
                     try:
-                        with Image.open(target_path) as img: width, height = img.size
-                    except Exception: width, height = 0, 0
-                    new_images.append({
-                        "id": image_id_counter, "task_id": task_id, "original_filename": sanitized_filename,
-                        "storage_path": target_path, "status": "unlabeled", "width": width, "height": height
-                    }); image_id_counter += 1
-        if new_images: db["images"] = pd.concat([db["images"], pd.DataFrame(new_images)], ignore_index=True)
+                        with zip_ref.open(filename) as source:
+                            img_bytes = source.read()
+                            
+                        # Open image with Pillow
+                        with Image.open(io.BytesIO(img_bytes)) as img:
+                            width, height = img.size
+                            
+                            # Convert to RGB if not already (TIFFs can be CMYK, etc.)
+                            # Save as PNG to an in-memory buffer
+                            img_buffer = io.BytesIO()
+                            if img.mode != "RGB" and img.mode != "RGBA":
+                                img = img.convert("RGB") # Convert to RGB for consistency
+
+                            img.save(img_buffer, format=output_format)
+                            img_buffer.seek(0)
+                            
+                            img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+                        
+                        new_images.append({
+                            "id": image_id_counter,
+                            "task_id": task_id,
+                            "original_filename": sanitized_filename,
+                            "data": img_base64, # Store Base64 data of the converted image
+                            "status": "unlabeled",
+                            "width": width,
+                            "height": height
+                        })
+                        image_id_counter += 1
+                    except Exception as e:
+                        print(f"Skipping {sanitized_filename} due to processing error: {e}")
+                        # Optionally, add a placeholder or mark as failed for this image
+                        # For now, we just skip and don't add to new_images
+                        continue
+        
+        if new_images:
+            db["images"] = pd.concat([db["images"], pd.DataFrame(new_images)], ignore_index=True)
+        
         task_idx = db["tasks"][db["tasks"]["id"] == task_id].index
-        if not task_idx.empty: db["tasks"].loc[task_idx, "status"] = "ready"
+        if not task_idx.empty:
+            db["tasks"].loc[task_idx, "status"] = "ready"
     except Exception as e:
         print(f"Error processing task {task_id}: {e}")
         task_idx = db["tasks"][db["tasks"]["id"] == task_id].index
-        if not task_idx.empty: db["tasks"].loc[task_idx, "status"] = "failed"
+        if not task_idx.empty:
+            db["tasks"].loc[task_idx, "status"] = "failed"
     finally:
-        save_table("images"); save_table("tasks")
-        if os.path.exists(zip_path): os.remove(zip_path)
+        save_table("images")
+        save_table("tasks")
 
 def get_next_id(table_name: str) -> int:
     table = db.get(table_name)
@@ -236,33 +271,50 @@ async def process_task_images(task_id: int, request: ProcessRequest):
         if request.action == "crop":
             for _, ann in annotations_df.iterrows():
                 img_rec = images_df[images_df["id"] == ann["image_id"]].iloc[0]
-                if not os.path.exists(img_rec["storage_path"]): continue
-                with Image.open(img_rec["storage_path"]) as img:
-                    bbox = ann["bounding_box"]
-                    box_tuple = (bbox['x'], bbox['y'], bbox['x'] + bbox['width'], bbox['y'] + bbox['height'])
-                    cropped = img.crop(box_tuple)
-                    img_byte_arr = io.BytesIO(); cropped.save(img_byte_arr, format='PNG'); img_byte_arr.seek(0)
-                    base, _ = os.path.splitext(img_rec["original_filename"])
-                    zip_file.writestr(f"{base}_crop_{ann['id']}.png", img_byte_arr.getvalue())
+                img_data_b64 = img_rec["data"]
+                
+                try:
+                    img_bytes = base64.b64decode(img_data_b64)
+                    # Open the image (it's already in a web-friendly format like PNG, but Pillow handles decoding)
+                    with Image.open(io.BytesIO(img_bytes)) as img:
+                        bbox = ann["bounding_box"]
+                        box_tuple = (int(bbox['x']), int(bbox['y']), int(bbox['x'] + bbox['width']), int(bbox['y'] + bbox['height']))
+                        cropped = img.crop(box_tuple)
+                        img_byte_arr = io.BytesIO(); cropped.save(img_byte_arr, format='PNG'); img_byte_arr.seek(0)
+                        base, _ = os.path.splitext(img_rec["original_filename"])
+                        zip_file.writestr(f"{base}_crop_{ann['id']}.png", img_byte_arr.getvalue())
+                except Exception as e:
+                    print(f"Error processing crop for image {img_rec['original_filename']}: {e}")
+                    continue
         else:
             imgs_to_process = images_df[images_df['id'].isin(set(annotations_df['image_id']))]
             for _, img_rec in imgs_to_process.iterrows():
-                if not os.path.exists(img_rec["storage_path"]): continue
-                with Image.open(img_rec["storage_path"]) as img:
-                    img = img.convert("RGBA")
-                    anns_for_img = annotations_df[annotations_df["image_id"] == img_rec["id"]]
-                    for _, ann in anns_for_img.iterrows():
-                        bbox = ann["bounding_box"]
-                        box = (int(bbox['x']), int(bbox['y']), int(bbox['x'] + bbox['width']), int(bbox['y'] + bbox['height']))
-                        if request.action == "blacken":
-                            region = Image.new('RGBA', (box[2]-box[0], box[3]-box[1]), (0, 0, 0, 255))
-                        elif request.action == "blur":
-                            region = img.crop(box)
-                            radius = max(1, min(request.blur_radius, 50))
-                            region = region.filter(ImageFilter.GaussianBlur(radius=radius))
-                        img.paste(region, box)
-                    img_byte_arr = io.BytesIO(); img.save(img_byte_arr, format='PNG'); img_byte_arr.seek(0)
-                    zip_file.writestr(img_rec["original_filename"], img_byte_arr.getvalue())
+                img_data_b64 = img_rec["data"]
+                
+                try:
+                    img_bytes = base64.b64decode(img_data_b64)
+                    # Open the image (it's already in a web-friendly format like PNG)
+                    with Image.open(io.BytesIO(img_bytes)) as img:
+                        img = img.convert("RGBA") # Ensure consistent mode for operations
+                        anns_for_img = annotations_df[annotations_df["image_id"] == img_rec["id"]]
+                        for _, ann in anns_for_img.iterrows():
+                            bbox = ann["bounding_box"]
+                            box = (int(bbox['x']), int(bbox['y']), int(bbox['x'] + bbox['width']), int(bbox['y'] + bbox['height']))
+                            
+                            if request.action == "blacken":
+                                region = Image.new('RGBA', (box[2]-box[0], box[3]-box[1]), (0, 0, 0, 255))
+                            elif request.action == "blur":
+                                region = img.crop(box)
+                                radius = max(1, min(request.blur_radius, 50))
+                                region = region.filter(ImageFilter.GaussianBlur(radius=radius))
+                            
+                            img.paste(region, box)
+                        
+                        img_byte_arr = io.BytesIO(); img.save(img_byte_arr, format='PNG'); img_byte_arr.seek(0)
+                        zip_file.writestr(img_rec["original_filename"], img_byte_arr.getvalue())
+                except Exception as e:
+                    print(f"Error processing {request.action} for image {img_rec['original_filename']}: {e}")
+                    continue
 
     zip_buffer.seek(0)
     filename = f"task_{task_id}_{request.action}.zip"
@@ -279,26 +331,20 @@ async def get_tasks():
 @app.post("/api/tasks/upload", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED, tags=["Tasks"])
 async def create_upload_task(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if not file.filename.endswith(".zip"): raise HTTPException(status_code=400, detail="Invalid file type.")
-    file_path = os.path.join(UPLOADS_DIR, file.filename)
-    with open(file_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
+    
+    zip_content = await file.read()
+    
     task_id = get_next_id("tasks")
     new_task = {"id": task_id, "name": file.filename, "status": "processing", "created_at": datetime.now()}
     db["tasks"] = pd.concat([db["tasks"], pd.DataFrame([new_task])], ignore_index=True)
     save_table("tasks")
-    background_tasks.add_task(process_zip_file, task_id, file_path)
+    
+    background_tasks.add_task(process_zip_file, task_id, zip_content)
     return new_task
 
 @app.get("/api/tasks/{task_id}/images", response_model=List[ImageOut], tags=["Images"])
 async def get_task_images(task_id: int):
     return db["images"][db["images"]["task_id"] == task_id].to_dict('records')
-
-@app.get("/api/images/{image_id}", tags=["Images"])
-async def get_image_file(image_id: int):
-    img_rec = db["images"][db["images"]["id"] == image_id]
-    if img_rec.empty: raise HTTPException(status_code=404, detail="Image not found")
-    path = img_rec.iloc[0]["storage_path"]
-    if not os.path.exists(path): raise HTTPException(status_code=404, detail="File not on disk")
-    return FileResponse(path)
 
 @app.get("/api/labels", response_model=List[LabelOut], tags=["Labels"])
 async def get_labels():
@@ -348,7 +394,7 @@ async def get_task_annotations(task_id: int):
 
 @app.get("/api/tasks/{task_id}/export", tags=["Export"])
 async def export_task_annotations_to_excel(task_id: int):
-    task_df, images_df, annotations_df, labels_df = db["tasks"], db["images"], db["annotations"], db["labels"]
+    task_df, images_df, annotations_df, labels_df = db["tasks"], db["images"], db["labels"], db["annotations"]
     task_rec = task_df[task_df["id"] == task_id]
     if task_rec.empty: raise HTTPException(status_code=404, detail="Task not found")
     images_df = images_df[images_df["task_id"] == task_id]

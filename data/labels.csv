@@ -1,5 +1,5 @@
 id,name
-1,Cat
-2,Dog
 3,Sign
-4,MICR
+4,Acc No
+5,Payee Name
+6,MICR
