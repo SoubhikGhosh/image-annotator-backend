@@ -194,3 +194,4 @@ cython_debug/
 .cursorindexingignore
 data/.DS_Store
 data/tasks/.DS_Store
+.DS_Store
