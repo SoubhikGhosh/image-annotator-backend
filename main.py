@@ -76,11 +76,18 @@ class ImageOut(BaseModel):
     height: int
     data: str # Base64 encoded image data
 
+class AnnotationSummary(BaseModel):
+    label_name: str
+    count: int
+
 class TaskOut(BaseModel):
     id: int
     name: str
     status: str
     created_at: datetime
+    total_images: int
+    labeled_images: int
+    annotation_summary: List[AnnotationSummary]
 
 class LabelOut(BaseModel):
     id: int
@@ -279,20 +286,64 @@ def update_statuses(image_id: int):
 @app.get("/api/dashboard-summary", response_model=DashboardStats, tags=["Dashboard"])
 async def get_dashboard_summary():
     tasks_df, images_df, labels_df, annotations_df = db["tasks"], db["images"], db["labels"], db["annotations"]
+    
     task_status_counts = tasks_df['status'].value_counts().to_dict() if not tasks_df.empty else {}
+    
     top_labels = []
     if not annotations_df.empty and not labels_df.empty:
-        label_counts = annotations_df['label_id'].value_counts().reset_index(); label_counts.columns = ['label_id', 'count']
+        label_counts = annotations_df['label_id'].value_counts().reset_index()
+        label_counts.columns = ['label_id', 'count']
         merged = pd.merge(label_counts, labels_df, left_on='label_id', right_on='id')
         top_labels = merged[['name', 'count']].sort_values('count', ascending=False).head(5).to_dict('records')
+        
+    # --- FIX: Calculate full details for recent tasks ---
     recent_tasks = []
     if not tasks_df.empty:
-        tasks_df_copy = tasks_df.copy(); tasks_df_copy['created_at'] = pd.to_datetime(tasks_df_copy['created_at'])
-        recent_tasks = tasks_df_copy.sort_values(by="created_at", ascending=False).head(5).to_dict('records')
-    return {"total_tasks": len(tasks_df), "total_images": len(images_df), "total_labels": len(labels_df),
-        "total_annotations": len(annotations_df), "task_status_counts": task_status_counts,
+        tasks_df_copy = tasks_df.copy()
+        tasks_df_copy['created_at'] = pd.to_datetime(tasks_df_copy['created_at'])
+        # Get the top 5 most recent tasks
+        sorted_tasks = tasks_df_copy.sort_values(by="created_at", ascending=False).head(5)
+        
+        for _, task in sorted_tasks.iterrows():
+            task_id = task['id']
+            
+            # Calculate image progress
+            task_images = images_df[images_df['task_id'] == task_id]
+            total_images = len(task_images)
+            labeled_images = len(task_images[task_images['status'] == 'labeled'])
+            
+            # Get annotation summary
+            annotation_summary = []
+            if not task_images.empty:
+                task_image_ids = set(task_images['id'])
+                task_annotations = annotations_df[annotations_df['image_id'].isin(task_image_ids)]
+                
+                if not task_annotations.empty:
+                    label_counts = task_annotations['label_id'].value_counts().reset_index()
+                    label_counts.columns = ['label_id', 'count']
+                    summary_df = pd.merge(label_counts, labels_df, left_on='label_id', right_on='id')
+                    annotation_summary = [
+                        {"label_name": row['name'], "count": row['count']}
+                        for _, row in summary_df.iterrows()
+                    ]
+
+            # Append the full task data that matches the TaskOut model
+            task_data = task.to_dict()
+            task_data['total_images'] = total_images
+            task_data['labeled_images'] = labeled_images
+            task_data['annotation_summary'] = annotation_summary
+            recent_tasks.append(task_data)
+
+    return {
+        "total_tasks": len(tasks_df), 
+        "total_images": len(images_df), 
+        "total_labels": len(labels_df),
+        "total_annotations": len(annotations_df), 
+        "task_status_counts": task_status_counts,
         "image_status_counts": images_df['status'].value_counts().to_dict() if not images_df.empty else {},
-        "top_labels": top_labels, "recent_tasks": recent_tasks}
+        "top_labels": top_labels, 
+        "recent_tasks": recent_tasks
+    }
 
 @app.post("/api/tasks/{task_id}/process", tags=["Export"])
 async def process_task_images(task_id: int, request: ProcessRequest):
@@ -359,9 +410,56 @@ async def process_task_images(task_id: int, request: ProcessRequest):
 # --- Standard CRUD Endpoints ---
 @app.get("/api/tasks", response_model=List[TaskOut], tags=["Tasks"])
 async def get_tasks():
-    if db["tasks"].empty: return []
-    tasks_df = db["tasks"].copy(); tasks_df['created_at'] = pd.to_datetime(tasks_df['created_at'])
-    return tasks_df.sort_values(by="created_at", ascending=False).to_dict('records')
+    # Get all required dataframes once
+    tasks_df = db["tasks"]
+    images_df = db["images"]
+    annotations_df = db["annotations"]
+    labels_df = db["labels"]
+
+    if tasks_df.empty:
+        return []
+
+    # Sort tasks by creation date
+    tasks_df_copy = tasks_df.copy()
+    tasks_df_copy['created_at'] = pd.to_datetime(tasks_df_copy['created_at'])
+    sorted_tasks = tasks_df_copy.sort_values(by="created_at", ascending=False)
+    
+    tasks_with_details = []
+    for _, task in sorted_tasks.iterrows():
+        task_id = task['id']
+        
+        # 1. Calculate image progress
+        task_images = images_df[images_df['task_id'] == task_id]
+        total_images = len(task_images)
+        labeled_images = len(task_images[task_images['status'] == 'labeled'])
+        
+        # 2. Get annotation summary
+        annotation_summary = []
+        if not task_images.empty:
+            task_image_ids = set(task_images['id'])
+            task_annotations = annotations_df[annotations_df['image_id'].isin(task_image_ids)]
+            
+            if not task_annotations.empty:
+                label_counts = task_annotations['label_id'].value_counts().reset_index()
+                label_counts.columns = ['label_id', 'count']
+                
+                # Merge with labels_df to get label names
+                summary_df = pd.merge(label_counts, labels_df, left_on='label_id', right_on='id')
+                
+                annotation_summary = [
+                    {"label_name": row['name'], "count": row['count']}
+                    for _, row in summary_df.iterrows()
+                ]
+
+        # 3. Append all data for the response
+        task_data = task.to_dict()
+        task_data['total_images'] = total_images
+        task_data['labeled_images'] = labeled_images
+        task_data['annotation_summary'] = annotation_summary
+        
+        tasks_with_details.append(task_data)
+
+    return tasks_with_details
 
 @app.post("/api/tasks/upload", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED, tags=["Tasks"])
 async def create_upload_task(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -370,12 +468,22 @@ async def create_upload_task(background_tasks: BackgroundTasks, file: UploadFile
     zip_content = await file.read()
     
     task_id = get_next_id("tasks")
-    new_task = {"id": task_id, "name": file.filename, "status": "processing", "created_at": datetime.now()}
-    db["tasks"] = pd.concat([db["tasks"], pd.DataFrame([new_task])], ignore_index=True)
+    new_task_data = {
+        "id": task_id, 
+        "name": file.filename, 
+        "status": "processing", 
+        "created_at": datetime.now()
+    }
+    db["tasks"] = pd.concat([db["tasks"], pd.DataFrame([new_task_data])], ignore_index=True)
     save_table("tasks")
     
     background_tasks.add_task(process_zip_file, task_id, zip_content)
-    return new_task
+    response_task = new_task_data.copy()
+    response_task['total_images'] = 0
+    response_task['labeled_images'] = 0
+    response_task['annotation_summary'] = []
+    
+    return response_task
 
 @app.delete("/api/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Tasks"])
 async def delete_task(task_id: int):
