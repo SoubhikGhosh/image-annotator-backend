@@ -3,6 +3,8 @@ import io
 import os
 import zipfile
 import base64
+import shutil
+import yaml
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
@@ -17,7 +19,7 @@ from PIL import Image, ImageFilter
 app = FastAPI(
     title="Image Labeling Tool API",
     description="API for a simple image labeling tool with file-based persistence and image processing.",
-    version="1.4.1"
+    version="1.5.0"
 )
 
 # --- CORS Configuration ---
@@ -128,8 +130,6 @@ def load_or_initialize_db():
     
     # Ensure 'bounding_box' is correctly parsed after loading from CSV
     if 'bounding_box' in db['annotations'].columns:
-        # Check if bounding_box column exists and convert string representations to actual dicts
-        # Only apply eval if the type is string, otherwise leave as is (e.g., if it's already dict)
         db['annotations']['bounding_box'] = db['annotations']['bounding_box'].apply(
             lambda x: eval(x) if isinstance(x, str) else x
         )
@@ -152,9 +152,7 @@ async def process_zip_file(task_id: int, zip_content: bytes):
     os.makedirs(task_dir, exist_ok=True)
 
     image_extensions = {".jpg", ".jpeg", ".png", ".tiff", ".bmp"}
-    # Define preferred output format and mime type for browser display
     output_format = "PNG"
-    output_mime_type = "image/png"
 
     try:
         current_max_id = db["images"]['id'].max() if not db["images"].empty else 0
@@ -172,35 +170,30 @@ async def process_zip_file(task_id: int, zip_content: bytes):
                         with zip_ref.open(filename) as source:
                             img_bytes = source.read()
                             
-                        # Open image with Pillow
-                        with Image.open(io.BytesIO(img_bytes)) as img:
-                            width, height = img.size
-                            
-                            # Convert to RGB if not already (TIFFs can be CMYK, etc.)
-                            # Save as PNG to an in-memory buffer
-                            img_buffer = io.BytesIO()
-                            if img.mode != "RGB" and img.mode != "RGBA":
-                                img = img.convert("RGB") # Convert to RGB for consistency
+                            with Image.open(io.BytesIO(img_bytes)) as img:
+                                width, height = img.size
+                                
+                                img_buffer = io.BytesIO()
+                                if img.mode != "RGB" and img.mode != "RGBA":
+                                    img = img.convert("RGB")
 
-                            img.save(img_buffer, format=output_format)
-                            img_buffer.seek(0)
+                                img.save(img_buffer, format=output_format)
+                                img_buffer.seek(0)
+                                
+                                img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
                             
-                            img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
-                        
-                        new_images.append({
-                            "id": image_id_counter,
-                            "task_id": task_id,
-                            "original_filename": sanitized_filename,
-                            "data": img_base64, # Store Base64 data of the converted image
-                            "status": "unlabeled",
-                            "width": width,
-                            "height": height
-                        })
-                        image_id_counter += 1
+                            new_images.append({
+                                "id": image_id_counter,
+                                "task_id": task_id,
+                                "original_filename": sanitized_filename,
+                                "data": img_base64,
+                                "status": "unlabeled",
+                                "width": width,
+                                "height": height
+                            })
+                            image_id_counter += 1
                     except Exception as e:
                         print(f"Skipping {sanitized_filename} due to processing error: {e}")
-                        # Optionally, add a placeholder or mark as failed for this image
-                        # For now, we just skip and don't add to new_images
                         continue
         
         if new_images:
@@ -275,7 +268,6 @@ async def process_task_images(task_id: int, request: ProcessRequest):
                 
                 try:
                     img_bytes = base64.b64decode(img_data_b64)
-                    # Open the image (it's already in a web-friendly format like PNG, but Pillow handles decoding)
                     with Image.open(io.BytesIO(img_bytes)) as img:
                         bbox = ann["bounding_box"]
                         box_tuple = (int(bbox['x']), int(bbox['y']), int(bbox['x'] + bbox['width']), int(bbox['y'] + bbox['height']))
@@ -293,9 +285,8 @@ async def process_task_images(task_id: int, request: ProcessRequest):
                 
                 try:
                     img_bytes = base64.b64decode(img_data_b64)
-                    # Open the image (it's already in a web-friendly format like PNG)
                     with Image.open(io.BytesIO(img_bytes)) as img:
-                        img = img.convert("RGBA") # Ensure consistent mode for operations
+                        img = img.convert("RGBA")
                         anns_for_img = annotations_df[annotations_df["image_id"] == img_rec["id"]]
                         for _, ann in anns_for_img.iterrows():
                             bbox = ann["bounding_box"]
@@ -341,6 +332,43 @@ async def create_upload_task(background_tasks: BackgroundTasks, file: UploadFile
     
     background_tasks.add_task(process_zip_file, task_id, zip_content)
     return new_task
+
+# --- MODIFIED CODE START (New Delete Task endpoint) ---
+@app.delete("/api/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Tasks"])
+async def delete_task(task_id: int):
+    """
+    Deletes a task and all associated data including images, annotations,
+    and the task directory.
+    """
+    global db
+    # 1. Check if task exists
+    task_idx = db["tasks"][db["tasks"]["id"] == task_id].index
+    if task_idx.empty:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # 2. Find associated image IDs
+    image_ids_to_delete = set(db["images"][db["images"]["task_id"] == task_id]["id"])
+
+    # 3. Delete annotations for those images
+    if image_ids_to_delete:
+        db["annotations"] = db["annotations"][~db["annotations"]["image_id"].isin(image_ids_to_delete)]
+
+    # 4. Delete the images
+    db["images"] = db["images"][db["images"]["task_id"] != task_id]
+
+    # 5. Delete the task
+    db["tasks"] = db["tasks"][db["tasks"]["id"] != task_id]
+    
+    # 6. Delete the physical task directory
+    task_dir = os.path.join(TASKS_DIR, str(task_id))
+    if os.path.exists(task_dir):
+        shutil.rmtree(task_dir)
+
+    # 7. Save changes to all tables
+    save_table("annotations")
+    save_table("images")
+    save_table("tasks")
+# --- MODIFIED CODE END ---
 
 @app.get("/api/tasks/{task_id}/images", response_model=List[ImageOut], tags=["Images"])
 async def get_task_images(task_id: int):
@@ -392,6 +420,7 @@ async def get_task_annotations(task_id: int):
     if not task_image_ids: return []
     return db["annotations"][db["annotations"]["image_id"].isin(task_image_ids)].to_dict('records')
 
+# --- MODIFIED CODE START (Excel export updated with full path) ---
 @app.get("/api/tasks/{task_id}/export", tags=["Export"])
 async def export_task_annotations_to_excel(task_id: int):
     task_df, images_df, annotations_df, labels_df = db["tasks"], db["images"], db["labels"], db["annotations"]
@@ -409,13 +438,93 @@ async def export_task_annotations_to_excel(task_id: int):
         bbox = ann["bounding_box"]
         export_data.append({
             "task_id": task_id, "task_name": task_rec.iloc[0]["name"], "image_id": ann["image_id"],
-            "image_filename": img_info["original_filename"], "image_width": img_info["width"], "image_height": img_info["height"],
+            "image_filename": img_info["original_filename"],
+            "image_path": f"images/{img_info['original_filename']}",
+            "image_width": img_info["width"], "image_height": img_info["height"],
             "annotation_id": ann["id"], "label_name": label_info["name"], "bbox_x": bbox["x"], "bbox_y": bbox["y"],
             "bbox_width": bbox["width"], "bbox_height": bbox["height"],
         })
     df = pd.DataFrame(export_data)
+    column_order = [
+        "task_id", "task_name", "image_id", "image_path", "image_filename", 
+        "image_width", "image_height", "annotation_id", "label_name", 
+        "bbox_x", "bbox_y", "bbox_width", "bbox_height"
+    ]
+    df = df[column_order]
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer: df.to_excel(writer, index=False, sheet_name='Annotations')
     output.seek(0)
     headers = {'Content-Disposition': f'attachment; filename="task_{task_id}_annotations.xlsx"'}
     return StreamingResponse(output, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+# --- MODIFIED CODE END ---
+
+# --- MODIFIED CODE START (New YOLO export endpoint) ---
+@app.get("/api/tasks/{task_id}/export-yolo", tags=["Export"])
+async def export_task_annotations_to_yolo(task_id: int):
+    # Fetch data
+    task = db["tasks"][db["tasks"]["id"] == task_id]
+    if task.empty: raise HTTPException(status_code=404, detail="Task not found")
+    
+    images_df = db["images"][db["images"]["task_id"] == task_id]
+    if images_df.empty: raise HTTPException(status_code=404, detail="No images in task.")
+
+    image_ids = set(images_df["id"])
+    annotations_df = db["annotations"][db["annotations"]["image_id"].isin(image_ids)]
+    if annotations_df.empty: raise HTTPException(status_code=404, detail="No annotations to export.")
+
+    # Create label mapping for this task's specific labels
+    label_ids_in_task = sorted(list(annotations_df["label_id"].unique()))
+    all_labels_df = db["labels"]
+    labels_in_task_df = all_labels_df[all_labels_df["id"].isin(label_ids_in_task)]
+    
+    label_map = {label_id: i for i, label_id in enumerate(labels_in_task_df["id"])}
+    class_names = list(labels_in_task_df["name"])
+
+    # Prepare for zipping
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        # Create dataset.yaml
+        dataset_yaml = {
+            'path': f'../{task.iloc[0]["name"].replace(".zip", "")}',
+            'train': 'images',
+            'val': 'images',
+            'names': {i: name for i, name in enumerate(class_names)}
+        }
+        zip_file.writestr("dataset.yaml", yaml.dump(dataset_yaml, sort_keys=False))
+
+        # Process each image with annotations
+        images_with_anns = images_df[images_df['id'].isin(set(annotations_df['image_id']))]
+        for _, img_rec in images_with_anns.iterrows():
+            # Write image file
+            try:
+                img_bytes = base64.b64decode(img_rec["data"])
+                image_path = f"images/{img_rec['original_filename']}"
+                zip_file.writestr(image_path, img_bytes)
+            except Exception:
+                continue # Skip if image data is corrupt
+
+            # Write YOLO label file
+            yolo_lines = []
+            anns_for_img = annotations_df[annotations_df["image_id"] == img_rec["id"]]
+            img_w, img_h = img_rec["width"], img_rec["height"]
+
+            for _, ann in anns_for_img.iterrows():
+                bbox = ann["bounding_box"]
+                label_idx = label_map.get(ann["label_id"])
+                if label_idx is None: continue
+
+                x_center = (bbox['x'] + bbox['width'] / 2) / img_w
+                y_center = (bbox['y'] + bbox['height'] / 2) / img_h
+                width_norm = bbox['width'] / img_w
+                height_norm = bbox['height'] / img_h
+                yolo_lines.append(f"{label_idx} {x_center:.6f} {y_center:.6f} {width_norm:.6f} {height_norm:.6f}")
+            
+            if yolo_lines:
+                base, _ = os.path.splitext(img_rec["original_filename"])
+                label_path = f"labels/{base}.txt"
+                zip_file.writestr(label_path, "\n".join(yolo_lines))
+
+    zip_buffer.seek(0)
+    filename = f"task_{task_id}_yolo.zip"
+    return StreamingResponse(zip_buffer, headers={'Content-Disposition': f'attachment; filename="{filename}"'}, media_type="application/zip")
