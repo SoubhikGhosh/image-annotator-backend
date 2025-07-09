@@ -147,11 +147,20 @@ def save_table(table_name: str):
 
 # --- Background & Helper Functions ---
 async def process_zip_file(task_id: int, zip_content: bytes):
-    await asyncio.sleep(2) # Simulate processing time
+    """
+    Processes an uploaded zip file in the background.
+    - Extracts valid image files (.jpg, .png, etc.) and single-page PDFs.
+    - Flattens the directory structure, renaming files with their path (e.g., folder_subfolder_file.png).
+    - Converts all extracted files to PNG format, encodes them in Base64, and adds them to the database.
+    - Updates the task status to 'ready' on success or 'failed' on error.
+    """
+    await asyncio.sleep(2)  # Simulate initial processing time
+
     task_dir = os.path.join(TASKS_DIR, str(task_id))
     os.makedirs(task_dir, exist_ok=True)
 
-    image_extensions = {".jpg", ".jpeg", ".png", ".tiff", ".bmp"}
+    # MODIFICATION: Added '.pdf' to the set of supported extensions.
+    image_extensions = {".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".pdf"}
     output_format = "PNG"
 
     try:
@@ -161,27 +170,61 @@ async def process_zip_file(task_id: int, zip_content: bytes):
 
         with zipfile.ZipFile(io.BytesIO(zip_content), 'r') as zip_ref:
             for filename in zip_ref.namelist():
-                if filename.startswith('__MACOSX/') or filename.split('/')[-1].startswith('.'): continue
-                if os.path.splitext(filename)[1].lower() in image_extensions:
-                    sanitized_filename = os.path.basename(filename)
-                    if not sanitized_filename: continue
-                    
+                # Skip common junk files, hidden files, and directory entries
+                if filename.startswith('__MACOSX/') or filename.endswith('/') or filename.split('/')[-1].startswith('.'):
+                    continue
+
+                file_ext = os.path.splitext(filename)[1].lower()
+                if file_ext in image_extensions:
+                    # MODIFICATION: Flatten folder structure into the filename.
+                    # e.g., "level1/level2/image.jpeg" becomes "level1_level2_image.png"
+                    base_name, _ = os.path.splitext(filename)
+                    sanitized_filename = f"{base_name.replace('/', '_')}.{output_format.lower()}"
+
+                    if not sanitized_filename:
+                        continue
+
                     try:
                         with zip_ref.open(filename) as source:
-                            img_bytes = source.read()
-                            
+                            content_bytes = source.read()
+                            img_bytes = None
+
+                            # MODIFICATION: Add block to handle PDF to image conversion.
+                            if file_ext == '.pdf':
+                                try:
+                                    pdf_doc = fitz.open(stream=content_bytes, filetype="pdf")
+                                    # Process only the first page of the PDF
+                                    if pdf_doc.page_count > 0:
+                                        page = pdf_doc.load_page(0)
+                                        pix = page.get_pixmap()
+                                        img_bytes = pix.tobytes(output_format.lower())
+                                    else:
+                                        print(f"Skipping empty or invalid PDF: {filename}")
+                                        continue
+                                    pdf_doc.close()
+                                except Exception as e:
+                                    print(f"Skipping {filename} due to PDF processing error: {e}")
+                                    continue
+                            else:
+                                # This is the original path for standard image files
+                                img_bytes = content_bytes
+
+                            if img_bytes is None:
+                                continue
+
+                            # Process the image bytes (from either PDF or image) using PIL
                             with Image.open(io.BytesIO(img_bytes)) as img:
                                 width, height = img.size
-                                
                                 img_buffer = io.BytesIO()
-                                if img.mode != "RGB" and img.mode != "RGBA":
+
+                                # Ensure consistency by converting to RGB if necessary
+                                if img.mode not in ("RGB", "RGBA"):
                                     img = img.convert("RGB")
 
                                 img.save(img_buffer, format=output_format)
                                 img_buffer.seek(0)
-                                
                                 img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
-                            
+
                             new_images.append({
                                 "id": image_id_counter,
                                 "task_id": task_id,
@@ -193,12 +236,12 @@ async def process_zip_file(task_id: int, zip_content: bytes):
                             })
                             image_id_counter += 1
                     except Exception as e:
-                        print(f"Skipping {sanitized_filename} due to processing error: {e}")
+                        print(f"Skipping file {filename} due to a general processing error: {e}")
                         continue
-        
+
         if new_images:
             db["images"] = pd.concat([db["images"], pd.DataFrame(new_images)], ignore_index=True)
-        
+
         task_idx = db["tasks"][db["tasks"]["id"] == task_id].index
         if not task_idx.empty:
             db["tasks"].loc[task_idx, "status"] = "ready"
@@ -333,7 +376,6 @@ async def create_upload_task(background_tasks: BackgroundTasks, file: UploadFile
     background_tasks.add_task(process_zip_file, task_id, zip_content)
     return new_task
 
-# --- MODIFIED CODE START (New Delete Task endpoint) ---
 @app.delete("/api/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Tasks"])
 async def delete_task(task_id: int):
     """
@@ -368,7 +410,6 @@ async def delete_task(task_id: int):
     save_table("annotations")
     save_table("images")
     save_table("tasks")
-# --- MODIFIED CODE END ---
 
 @app.get("/api/tasks/{task_id}/images", response_model=List[ImageOut], tags=["Images"])
 async def get_task_images(task_id: int):
@@ -420,7 +461,6 @@ async def get_task_annotations(task_id: int):
     if not task_image_ids: return []
     return db["annotations"][db["annotations"]["image_id"].isin(task_image_ids)].to_dict('records')
 
-# --- MODIFIED CODE START (Excel export updated with full path) ---
 @app.get("/api/tasks/{task_id}/export", tags=["Export"])
 async def export_task_annotations_to_excel(task_id: int):
     task_df, images_df, annotations_df, labels_df = db["tasks"], db["images"], db["labels"], db["annotations"]
@@ -439,12 +479,19 @@ async def export_task_annotations_to_excel(task_id: int):
         export_data.append({
             "task_id": task_id, "task_name": task_rec.iloc[0]["name"], "image_id": ann["image_id"],
             "image_filename": img_info["original_filename"],
-            "image_path": f"images/{img_info['original_filename']}",
+            "image_path": img_info['original_filename'],
             "image_width": img_info["width"], "image_height": img_info["height"],
             "annotation_id": ann["id"], "label_name": label_info["name"], "bbox_x": bbox["x"], "bbox_y": bbox["y"],
             "bbox_width": bbox["width"], "bbox_height": bbox["height"],
         })
     df = pd.DataFrame(export_data)
+
+    column_order = [
+        "task_id", "task_name", "image_id", "image_path", "image_filename", 
+        "image_width", "image_height", "annotation_id", "label_name", 
+        "bbox_x", "bbox_y", "bbox_width", "bbox_height"
+    ]
+    df = df[column_order]
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer: df.to_excel(writer, index=False, sheet_name='Annotations')
@@ -452,7 +499,6 @@ async def export_task_annotations_to_excel(task_id: int):
     headers = {'Content-Disposition': f'attachment; filename="task_{task_id}_annotations.xlsx"'}
     return StreamingResponse(output, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-# --- MODIFIED CODE START (New YOLO export endpoint) ---
 @app.get("/api/tasks/{task_id}/export-yolo", tags=["Export"])
 async def export_task_annotations_to_yolo(task_id: int):
     # Fetch data
