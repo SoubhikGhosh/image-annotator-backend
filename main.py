@@ -445,19 +445,12 @@ async def export_task_annotations_to_excel(task_id: int):
             "bbox_width": bbox["width"], "bbox_height": bbox["height"],
         })
     df = pd.DataFrame(export_data)
-    column_order = [
-        "task_id", "task_name", "image_id", "image_path", "image_filename", 
-        "image_width", "image_height", "annotation_id", "label_name", 
-        "bbox_x", "bbox_y", "bbox_width", "bbox_height"
-    ]
-    df = df[column_order]
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer: df.to_excel(writer, index=False, sheet_name='Annotations')
     output.seek(0)
     headers = {'Content-Disposition': f'attachment; filename="task_{task_id}_annotations.xlsx"'}
     return StreamingResponse(output, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-# --- MODIFIED CODE END ---
 
 # --- MODIFIED CODE START (New YOLO export endpoint) ---
 @app.get("/api/tasks/{task_id}/export-yolo", tags=["Export"])
