@@ -35,6 +35,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"]
 )
 
 # --- Directory and Data File Setup ---
@@ -463,7 +464,7 @@ async def get_task_annotations(task_id: int):
 
 @app.get("/api/tasks/{task_id}/export", tags=["Export"])
 async def export_task_annotations_to_excel(task_id: int):
-    task_df, images_df, annotations_df, labels_df = db["tasks"], db["images"], db["labels"], db["annotations"]
+    task_df, images_df, annotations_df, labels_df = db["tasks"], db["images"], db["annotations"], db["labels"]
     task_rec = task_df[task_df["id"] == task_id]
     if task_rec.empty: raise HTTPException(status_code=404, detail="Task not found")
     images_df = images_df[images_df["task_id"] == task_id]
@@ -478,21 +479,11 @@ async def export_task_annotations_to_excel(task_id: int):
         bbox = ann["bounding_box"]
         export_data.append({
             "task_id": task_id, "task_name": task_rec.iloc[0]["name"], "image_id": ann["image_id"],
-            "image_filename": img_info["original_filename"],
-            "image_path": img_info['original_filename'],
-            "image_width": img_info["width"], "image_height": img_info["height"],
+            "image_filename": img_info["original_filename"], "image_width": img_info["width"], "image_height": img_info["height"],
             "annotation_id": ann["id"], "label_name": label_info["name"], "bbox_x": bbox["x"], "bbox_y": bbox["y"],
             "bbox_width": bbox["width"], "bbox_height": bbox["height"],
         })
     df = pd.DataFrame(export_data)
-
-    column_order = [
-        "task_id", "task_name", "image_id", "image_path", "image_filename", 
-        "image_width", "image_height", "annotation_id", "label_name", 
-        "bbox_x", "bbox_y", "bbox_width", "bbox_height"
-    ]
-    df = df[column_order]
-
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer: df.to_excel(writer, index=False, sheet_name='Annotations')
     output.seek(0)
