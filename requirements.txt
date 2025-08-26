@@ -6,3 +6,6 @@ pandas
 openpyxl
 Pillow
 PyMuPDF
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart 
